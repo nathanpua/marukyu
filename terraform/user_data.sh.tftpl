@@ -1,0 +1,115 @@
+#!/bin/bash
+set -uo pipefail
+
+exec > >(tee -a /var/log/monitor-setup.log) 2>&1
+echo "=== Setup started at $(date) ==="
+
+echo "[1/11] Creating 1GB swap file..."
+fallocate -l 1G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+echo 'vm.swappiness=10' >> /etc/sysctl.conf
+sysctl -p
+free -h
+
+echo "[2/11] Installing system packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get upgrade -y
+apt-get install -y \
+    python3 python3-pip python3-venv \
+    wget curl git unzip \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+    libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
+    libxshmfence1 fonts-liberation
+
+echo "[3/11] Creating app user and directories..."
+useradd -m -s /bin/bash monitor || true
+mkdir -p /opt/marukyu-monitor /var/log/marukyu-monitor
+chown monitor:monitor /opt/marukyu-monitor /var/log/marukyu-monitor
+
+echo "[4/11] Setting up Python virtual environment..."
+sudo -u monitor python3 -m venv /opt/marukyu-monitor/venv
+sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --upgrade pip
+
+echo "[5/11] Installing Python dependencies..."
+sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install \
+    'scrapling>=0.4.7' \
+    'curl_cffi>=0.15.0' \
+    'patchright' \
+    'playwright' \
+    'msgspec' \
+    'camoufox' \
+    'click'
+
+echo "[6/11] Installing Chromium browser for Scrapling..."
+sudo -u monitor HOME=/home/monitor /opt/marukyu-monitor/venv/bin/python -m patchright install chromium || true
+
+echo "[7/11] Deploying monitor script..."
+sudo -u monitor tee /opt/marukyu-monitor/monitor_light.py > /dev/null << 'MONITOR_SCRIPT'
+${monitor_script}
+MONITOR_SCRIPT
+
+echo "[8/11] Installing CloudWatch Agent..."
+wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i /tmp/amazon-cloudwatch-agent.deb
+rm /tmp/amazon-cloudwatch-agent.deb
+
+echo "[9/11] Configuring CloudWatch Agent..."
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWCONFIG'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/marukyu-monitor/monitor.log",
+            "log_group_name": "${log_group_name}",
+            "log_stream_name": "{instance_id}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S"
+          }
+        ]
+      }
+    }
+  }
+}
+CWCONFIG
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+echo "[10/11] Creating systemd service..."
+cat > /etc/systemd/system/marukyu-monitor.service << SERVICEFILE
+[Unit]
+Description=Marukyu Matcha Stock Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor
+Group=monitor
+WorkingDirectory=/opt/marukyu-monitor
+ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py --interval ${poll_interval}${telegram_flags}
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/marukyu-monitor/monitor.log
+StandardError=append:/var/log/marukyu-monitor/monitor.log
+Environment=HOME=/home/monitor
+Environment=PATH=/opt/marukyu-monitor/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
+SERVICEFILE
+
+echo "[11/11] Starting services..."
+systemctl daemon-reload
+systemctl enable marukyu-monitor
+systemctl start marukyu-monitor
+
+echo "=== Setup completed at $(date) ==="
+systemctl status marukyu-monitor --no-pager || true
