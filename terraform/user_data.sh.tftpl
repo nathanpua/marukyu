@@ -1,5 +1,5 @@
 #!/bin/bash
-set -uo pipefail
+set -euo pipefail
 
 exec > >(tee -a /var/log/monitor-setup.log) 2>&1
 echo "=== Setup started at $(date) ==="
@@ -17,7 +17,7 @@ free -h
 echo "[2/11] Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get upgrade -y
+apt-get upgrade -y || echo "WARN: apt-get upgrade returned non-zero, continuing"
 apt-get install -y \
     python3 python3-pip python3-venv \
     wget curl git unzip \
@@ -38,13 +38,14 @@ sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --upgrade pip
 
 echo "[5/11] Installing Python dependencies..."
 sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install \
-    'scrapling>=0.4.7' \
-    'curl_cffi>=0.15.0' \
-    'patchright' \
-    'playwright' \
-    'msgspec' \
-    'camoufox' \
-    'click'
+    'scrapling==0.4.8' \
+    'curl_cffi==0.15.0' \
+    'patchright==1.60.0' \
+    'playwright==1.60.0' \
+    'msgspec==0.21.1' \
+    'camoufox==0.4.11' \
+    'click==8.4.1' \
+    'boto3==1.43.14'
 
 echo "[6/11] Installing Chromium browser for Scrapling..."
 sudo -u monitor HOME=/home/monitor /opt/marukyu-monitor/venv/bin/python -m patchright install chromium || true
@@ -56,7 +57,7 @@ MONITOR_SCRIPT
 
 echo "[8/11] Installing CloudWatch Agent..."
 wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i /tmp/amazon-cloudwatch-agent.deb
+dpkg -i /tmp/amazon-cloudwatch-agent.deb || apt-get install -fy
 rm /tmp/amazon-cloudwatch-agent.deb
 
 echo "[9/11] Configuring CloudWatch Agent..."
@@ -80,7 +81,8 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWCO
 }
 CWCONFIG
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+    || echo "WARN: CloudWatch agent fetch-config returned non-zero, continuing"
 
 echo "[10/11] Creating systemd service..."
 cat > /etc/systemd/system/marukyu-monitor.service << SERVICEFILE
@@ -94,7 +96,7 @@ Type=simple
 User=monitor
 Group=monitor
 WorkingDirectory=/opt/marukyu-monitor
-ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py --interval ${poll_interval}${telegram_flags}
+ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py %{ for u in monitor_urls }--url "${u}" %{ endfor }--interval ${poll_interval}%{ if telegram_enabled } --telegram-ssm-bot-token-param ${ssm_bot_token_param} --telegram-ssm-chat-id-param ${ssm_chat_id_param} --aws-region ${region}%{ endif }
 Restart=always
 RestartSec=30
 StandardOutput=append:/var/log/marukyu-monitor/monitor.log

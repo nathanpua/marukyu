@@ -1,0 +1,99 @@
+name: terraform plan
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'monitor_light.py'
+      - '.github/workflows/terraform-*.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'monitor_light.py'
+      - '.github/workflows/terraform-*.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ap-southeast-1
+      TF_VAR_telegram_bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TF_VAR_telegram_chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TF_VAR_telegram_alarm_email: ${{ secrets.TELEGRAM_ALARM_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: .
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=marukyu/terraform.tfstate" \
+            -backend-config="region=ap-southeast-1" \
+            -backend-config="dynamodb_table=marukyu-tfstate-lock" \
+            -backend-config="encrypt=true"
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -input=false -out=tfplan
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_EXIT: ${{ steps.plan.outputs.exit_code }}
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            let output;
+            try {
+              output = execSync('terraform show -no-color tfplan', {
+                cwd: 'terraform',
+                encoding: 'utf8',
+                maxBuffer: 1024 * 1024 * 10,
+              });
+            } catch (e) {
+              output = `Failed to render plan: ${e.message}`;
+            }
+            const truncated = output.length > 60000
+              ? output.slice(0, 60000) + '\n\n... (truncated)'
+              : output;
+            const exit = process.env.PLAN_EXIT;
+            const status = exit === '0' ? 'succeeded' : 'failed';
+            const body = `### terraform plan ${status} (exit ${exit})\n\n<details><summary>Plan output</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n\n</details>`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Fail job if plan errored
+        if: steps.plan.outputs.exit_code != '0'
+        run: exit 1
