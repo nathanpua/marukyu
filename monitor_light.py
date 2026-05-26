@@ -28,7 +28,7 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from curl_cffi import requests as cffi_requests
@@ -56,6 +56,8 @@ BURST_RESTOCK_THRESHOLD = 5   # restocks in one cycle that trigger slow-poll mod
 BURST_POLL_INTERVAL = 3600    # 1 hour — poll interval for rest of day after burst
 SIZE_TERMS_TTL = 3600  # seconds between refreshes of the WC size→slug mapping
 SHOP_BASE_URL = "https://www.marukyu-koyamaen.co.jp/english/shop"
+DAILY_REPORT_HOUR_JST = 17   # send daily report at or after this hour (JST, 24h)
+_JST = timezone(timedelta(hours=9))
 
 # Japanese product names shown alongside English in notifications.
 # Format: "English Name": "日本語名"
@@ -235,6 +237,35 @@ def notify_telegram_heartbeat(bot_token: str, chat_id: str, products: List[Produ
         log.info("Telegram heartbeat sent")
     except Exception as e:
         log.warning(f"Telegram heartbeat failed: {e}")
+
+
+def notify_telegram_daily_report(
+    bot_token: str,
+    chat_id: str,
+    restocks: Dict[str, bool],
+    report_dt: datetime,
+) -> None:
+    """Send end-of-day restock summary. restocks maps product name → currently in stock."""
+    date_str = report_dt.strftime("%a, %d %b %Y")
+    if restocks:
+        lines = []
+        for name in sorted(restocks):
+            still_in = restocks[name]
+            icon = "✅" if still_in else "\U0001f504"
+            status = "still in stock" if still_in else "back out of stock"
+            lines.append(f"  {icon} {_format_name(name)} — {status}")
+        items_text = "\n".join(lines)
+    else:
+        items_text = "  (none today)"
+    text = (
+        f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n"
+        f"<b>Restocked today:</b>\n{items_text}"
+    )
+    try:
+        _telegram_post(bot_token, chat_id, text)
+        log.info("Daily report sent")
+    except Exception as e:
+        log.warning(f"Daily report failed: {e}")
 
 
 def notify_telegram(
@@ -500,6 +531,9 @@ class LightweightStockMonitor:
         self._size_terms: Dict[str, str] = {}
         self._size_terms_fetched_at: Optional[float] = None
         self._slow_poll_date: Optional[str] = None  # YYYY-MM-DD when burst slow-poll is active
+        self._today_date_jst: str = datetime.now(_JST).strftime("%Y-%m-%d")
+        self._today_restocks: Dict[str, bool] = {}  # name → current in_stock, for items that restocked today
+        self._daily_report_sent_date: Optional[str] = None  # YYYY-MM-DD (JST) when last daily report was sent
         self.running = True
         self._load_state()
         self._setup_signals()
@@ -623,6 +657,25 @@ class LightweightStockMonitor:
             notify_telegram_heartbeat(self.telegram_bot_token, self.telegram_chat_id, products)
             self._last_heartbeat_at = now
 
+    def _check_date_rollover(self) -> None:
+        today = datetime.now(_JST).strftime("%Y-%m-%d")
+        if today != self._today_date_jst:
+            log.info(f"Date rolled over to {today} JST — resetting daily restock tracking")
+            self._today_date_jst = today
+            self._today_restocks = {}
+
+    def _maybe_send_daily_report(self) -> None:
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            return
+        now_jst = datetime.now(_JST)
+        today = now_jst.strftime("%Y-%m-%d")
+        if now_jst.hour >= DAILY_REPORT_HOUR_JST and today != self._daily_report_sent_date:
+            notify_telegram_daily_report(
+                self.telegram_bot_token, self.telegram_chat_id,
+                dict(self._today_restocks), now_jst,
+            )
+            self._daily_report_sent_date = today
+
     def _handle_changes(self, changes: List[StockChange]) -> None:
         for change in changes:
             arrow = "IN" if change.new_status == "In Stock" else "OUT"
@@ -663,7 +716,12 @@ class LightweightStockMonitor:
                     f"{change.product.name} is now {change.new_status}! ({change.product.price})",
                 )
 
-        restock_count = sum(1 for c in changes if c.new_status == "In Stock")
+        restock_count = 0
+        for c in changes:
+            if c.new_status == "In Stock":
+                restock_count += 1
+                self._today_restocks[c.product.name] = True
+
         if restock_count > BURST_RESTOCK_THRESHOLD:
             self._slow_poll_date = datetime.now().strftime("%Y-%m-%d")
             log.info(
@@ -693,6 +751,7 @@ class LightweightStockMonitor:
         try:
             while self.running:
                 loop_start = time.time()
+                self._check_date_rollover()
 
                 try:
                     all_products: List[Product] = []
@@ -729,8 +788,13 @@ class LightweightStockMonitor:
 
                         self.previous_state = current_state
                         self._save_state()
+                        # Refresh current status for every product that restocked today
+                        for name in self._today_restocks:
+                            if name in current_state:
+                                self._today_restocks[name] = current_state[name]
                         if not changes and not is_initial:
                             self._maybe_send_heartbeat(all_products)
+                        self._maybe_send_daily_report()
                     elif self.url_configs:
                         log.warning("No products matched across all URLs")
 
