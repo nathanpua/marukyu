@@ -51,7 +51,6 @@ jobs:
           # Use jq to safely construct JSON without shell quoting issues
           PARAMS=$(jq -n --arg url "$RAW_URL" '{
             commands: [
-              "set -euo pipefail",
               ("curl -fsSL '" + $url + "' -o /tmp/monitor_light_new.py"),
               "/opt/marukyu-monitor/venv/bin/python3 -m py_compile /tmp/monitor_light_new.py && echo \"Syntax OK\"",
               "cp /tmp/monitor_light_new.py /opt/marukyu-monitor/monitor_light.py",
