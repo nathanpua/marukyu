@@ -1,0 +1,118 @@
+name: deploy script to EC2
+
+# Deploys monitor_light.py in-place via SSM — preserves state.json on the instance.
+# Use this whenever only monitor_light.py changed.
+# For changes to user_data.sh.tftpl or Python deps, use terraform apply instead.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'monitor_light.py'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ap-southeast-1
+
+    steps:
+      - name: Find running instance
+        id: instance
+        run: |
+          ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=marukyu-matcha-monitor" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          if [ -z "$ID" ] || [ "$ID" = "None" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::No running instance found — instance may be stopped by scheduler. Re-run this workflow manually after it starts."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "id=$ID" >> "$GITHUB_OUTPUT"
+            echo "Instance: $ID"
+          fi
+
+      - name: Send deploy command via SSM
+        if: steps.instance.outputs.skip != 'true'
+        id: ssm
+        run: |
+          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/monitor_light.py"
+
+          # Use jq to safely construct JSON without shell quoting issues
+          PARAMS=$(jq -n --arg url "$RAW_URL" '{
+            commands: [
+              "set -euo pipefail",
+              ("curl -fsSL '" + $url + "' -o /tmp/monitor_light_new.py"),
+              "/opt/marukyu-monitor/venv/bin/python3 -m py_compile /tmp/monitor_light_new.py && echo \"Syntax OK\"",
+              "cp /tmp/monitor_light_new.py /opt/marukyu-monitor/monitor_light.py",
+              "chown monitor:monitor /opt/marukyu-monitor/monitor_light.py",
+              "systemctl restart marukyu-monitor",
+              "sleep 3 && systemctl is-active marukyu-monitor && echo \"Service running\""
+            ]
+          }')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.instance.outputs.id }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${{ github.sha }}" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" \
+            --output text)
+          echo "cmd_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $CMD_ID"
+
+      - name: Wait for result
+        if: steps.instance.outputs.skip != 'true'
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.id }}"
+          CMD_ID="${{ steps.ssm.outputs.cmd_id }}"
+
+          for i in $(seq 1 24); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "[$i/24] $STATUS"
+            case "$STATUS" in
+              Success)
+                echo "--- stdout ---"
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+                echo "Deploy succeeded"
+                exit 0
+                ;;
+              Failed|TimedOut|Cancelled|Cancelling)
+                echo "--- stdout ---"
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+                echo "--- stderr ---"
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardErrorContent" \
+                  --output text
+                echo "::error::Deploy failed with status: $STATUS"
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::Timed out waiting for SSM result (120s)"
+          exit 1
