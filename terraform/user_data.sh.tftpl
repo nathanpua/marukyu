@@ -5,11 +5,16 @@ exec > >(tee -a /var/log/monitor-setup.log) 2>&1
 echo "=== Setup started at $(date) ==="
 
 echo "[1/11] Creating 1GB swap file..."
-fallocate -l 1G /swapfile
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-echo '/swapfile none swap sw 0 0' >> /etc/fstab
+if [ ! -f /swapfile ]; then
+    fallocate -l 1G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+else
+    echo "WARN: /swapfile already exists, skipping swap creation"
+    swapon /swapfile 2>/dev/null || true
+fi
 echo 'vm.swappiness=10' >> /etc/sysctl.conf
 sysctl -p
 free -h
@@ -37,7 +42,7 @@ sudo -u monitor python3 -m venv /opt/marukyu-monitor/venv
 sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --upgrade pip
 
 echo "[5/11] Installing Python dependencies..."
-sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install \
+sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --retries 5 \
     'scrapling==0.4.8' \
     'curl_cffi==0.15.0' \
     'patchright==1.60.0' \
@@ -56,9 +61,12 @@ ${monitor_script}
 MONITOR_SCRIPT
 
 echo "[8/11] Installing CloudWatch Agent..."
-wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i /tmp/amazon-cloudwatch-agent.deb || apt-get install -fy
-rm /tmp/amazon-cloudwatch-agent.deb
+wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb \
+    || { echo "WARN: CloudWatch agent download failed, skipping CW agent install"; rm -f /tmp/amazon-cloudwatch-agent.deb; }
+if [ -f /tmp/amazon-cloudwatch-agent.deb ]; then
+    dpkg -i /tmp/amazon-cloudwatch-agent.deb || apt-get install -fy
+    rm /tmp/amazon-cloudwatch-agent.deb
+fi
 
 echo "[9/11] Configuring CloudWatch Agent..."
 mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
@@ -85,7 +93,7 @@ CWCONFIG
     || echo "WARN: CloudWatch agent fetch-config returned non-zero, continuing"
 
 echo "[10/11] Creating systemd service..."
-cat > /etc/systemd/system/marukyu-monitor.service << SERVICEFILE
+cat > /etc/systemd/system/marukyu-monitor.service << 'SERVICEFILE'
 [Unit]
 Description=Marukyu Matcha Stock Monitor
 After=network-online.target

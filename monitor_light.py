@@ -117,10 +117,13 @@ def _parse_url_arg(arg: str) -> UrlConfig:
     """Parse 'URL' or 'URL|Name1,Name2' into a UrlConfig."""
     if "|" in arg:
         url, names_str = arg.split("|", 1)
-        watch_names = frozenset(n.strip() for n in names_str.split(",") if n.strip())
+        watch_names: Optional[frozenset] = frozenset(n.strip() for n in names_str.split(",") if n.strip())
+        if not watch_names:
+            log.warning(f"'--url {arg}' has a pipe but no product names after it — watching all products on that page")
+            watch_names = None
     else:
         url, watch_names = arg, None
-    return UrlConfig(url=url.strip(), watch_names=watch_names or None)
+    return UrlConfig(url=url.strip(), watch_names=watch_names)
 
 
 def parse_products(html: str) -> List[Product]:
@@ -418,13 +421,16 @@ def fetch_variation_stock(
         return None
     product_id = pid_m.group(1)
 
+    # Extract the full <dl class="pa-size"> block, then collect every <dd> within it.
+    dl_blocks = re.findall(
+        r'<dl[^>]*class="[^"]*pa-size[^"]*"[^>]*>(.*?)</dl>',
+        page_html,
+        re.DOTALL,
+    )
     size_names = [
-        _clean_html(s)
-        for s in re.findall(
-            r'<dl[^>]*class="[^"]*pa-size[^"]*"[^>]*>.*?<dd>(.*?)</dd>',
-            page_html,
-            re.DOTALL,
-        )
+        _clean_html(dd)
+        for block in dl_blocks
+        for dd in re.findall(r'<dd>(.*?)</dd>', block, re.DOTALL)
     ]
     if not size_names:
         log.warning(f"No sizes found in {product_url}")
@@ -468,7 +474,7 @@ def fetch_variation_stock(
         except Exception as e:
             log.debug(f"Variation AJAX failed for '{size_name}': {e}")
 
-    return results or None
+    return results if results else None
 
 
 class LightweightStockMonitor:
@@ -628,6 +634,7 @@ class LightweightStockMonitor:
                 and self.telegram_chat_id
                 and change.new_status == "In Stock"
                 and change.product.url
+                and self.session_cookies
             ):
                 try:
                     size_terms = self._get_size_terms()
@@ -710,6 +717,7 @@ class LightweightStockMonitor:
                         current_state = {p.name: p.in_stock for p in all_products}
                         changes: List[StockChange] = []
 
+                        is_initial = not self.previous_state
                         if self.previous_state:
                             changes = detect_changes(all_products, self.previous_state)
                             if changes:
@@ -721,7 +729,7 @@ class LightweightStockMonitor:
 
                         self.previous_state = current_state
                         self._save_state()
-                        if not changes:
+                        if not changes and not is_initial:
                             self._maybe_send_heartbeat(all_products)
                     elif self.url_configs:
                         log.warning("No products matched across all URLs")

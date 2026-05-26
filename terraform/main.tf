@@ -195,9 +195,13 @@ resource "aws_iam_role_policy" "ec2_ssm_secrets" {
         ]
       },
       {
-        Effect   = "Allow"
-        Action   = ["kms:Decrypt"]
-        Resource = "*"
+        Effect = "Allow"
+        Action = ["kms:Decrypt"]
+        # Scope to only the KMS keys that encrypt the two Telegram SSM parameters.
+        # aws_ssm_parameter always uses the default SSM KMS key (alias/aws/ssm)
+        # unless a custom key is specified — reference it by alias ARN so we don't
+        # need to look up the actual key ID.
+        Resource = "arn:aws:kms:${var.region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
         Condition = {
           StringEquals = {
             "kms:ViaService" = "ssm.${var.region}.amazonaws.com"
