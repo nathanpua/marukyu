@@ -243,28 +243,47 @@ def notify_telegram_heartbeat(bot_token: str, chat_id: str, products: List[Produ
 def notify_telegram_daily_report(
     bot_token: str,
     chat_id: str,
-    restocks: Dict[str, bool],
+    restock_packages: Dict[str, Dict[str, bool]],
     all_state: Dict[str, bool],
     report_dt: datetime,
 ) -> None:
     """Send end-of-day restock summary.
-    restocks: name → currently in stock (only products restocked today)
-    all_state: name → currently in stock (all monitored products)
+    restock_packages: product → {package → currently_in_stock} (only products restocked today)
+    all_state: product → currently_in_stock (all monitored products)
     """
     date_str = report_dt.strftime("%a, %d %b %Y")
-    still_in = {n for n, v in restocks.items() if v}
-    back_out = {n for n, v in restocks.items() if not v}
-    never = {n for n in all_state if n not in restocks}
-    lines = (
-        [f"✅ {_format_name(n)}" for n in sorted(still_in)]
-        + [f"🔄 {_format_name(n)}" for n in sorted(back_out)]
-        + [f"❌ {_format_name(n)}" for n in sorted(never)]
-    )
+
+    still_in_rows: List[Tuple[str, Dict[str, bool]]] = []
+    cycled_rows: List[Tuple[str, Dict[str, bool]]] = []
+    never_names: List[str] = []
+
+    for name in sorted(all_state.keys()):
+        if name not in restock_packages:
+            never_names.append(name)
+            continue
+        pkgs = restock_packages[name]
+        if any(v for v in pkgs.values()):
+            still_in_rows.append((name, pkgs))
+        else:
+            cycled_rows.append((name, pkgs))
+
+    def _pkg_str(pkgs: Dict[str, bool]) -> str:
+        parts = [f"✅ {p}" for p, v in sorted(pkgs.items()) if v]
+        parts += [f"🔄 {p}" for p, v in sorted(pkgs.items()) if not v]
+        return " | ".join(parts)
+
+    lines = []
+    for name, pkgs in still_in_rows:
+        suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
+        lines.append(f"✅ {_format_name(name)}{suffix}")
+    for name, pkgs in cycled_rows:
+        suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
+        lines.append(f"🔄 {_format_name(name)}{suffix}")
+    for name in never_names:
+        lines.append(f"❌ {_format_name(name)}")
+
     items_text = "\n".join(lines) if lines else "  (no products tracked)"
-    text = (
-        f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n"
-        f"{items_text}"
-    )
+    text = f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n{items_text}"
     try:
         _telegram_post(bot_token, chat_id, text)
         log.info("Daily report sent")
@@ -588,7 +607,7 @@ class LightweightStockMonitor:
         self._size_terms_fetched_at: Optional[float] = None
         self._slow_poll_date: Optional[str] = None  # YYYY-MM-DD when burst slow-poll is active
         self._today_date_jst: str = datetime.now(_JST).strftime("%Y-%m-%d")
-        self._today_restocks: Dict[str, bool] = {}  # name → current in_stock, for items that restocked today
+        self._today_restock_packages: Dict[str, Dict[str, bool]] = {}  # product → {package → currently_in_stock}
         self._daily_report_sent_date: Optional[str] = None  # YYYY-MM-DD (JST) when last daily report was sent
         self.running = True
         self._load_state()
@@ -718,7 +737,7 @@ class LightweightStockMonitor:
         if today != self._today_date_jst:
             log.info(f"Date rolled over to {today} JST — resetting daily restock tracking")
             self._today_date_jst = today
-            self._today_restocks = {}
+            self._today_restock_packages = {}
 
     def _maybe_send_daily_report(self) -> None:
         if not self.telegram_bot_token or not self.telegram_chat_id:
@@ -728,7 +747,8 @@ class LightweightStockMonitor:
         if now_jst.hour >= DAILY_REPORT_HOUR_JST and today != self._daily_report_sent_date:
             notify_telegram_daily_report(
                 self.telegram_bot_token, self.telegram_chat_id,
-                dict(self._today_restocks), dict(self.previous_state), now_jst,
+                {k: dict(v) for k, v in self._today_restock_packages.items()},
+                dict(self.previous_state), now_jst,
             )
             self._daily_report_sent_date = today
 
@@ -780,8 +800,12 @@ class LightweightStockMonitor:
                 )
 
         restock_count = len(restock_items)
-        for change, _ in restock_items:
-            self._today_restocks[change.product.name] = True
+        for change, variations in restock_items:
+            pkgs = self._today_restock_packages.setdefault(change.product.name, {})
+            if variations:
+                for v in variations:
+                    if v.is_in_stock:
+                        pkgs[v.size] = True
 
         if restock_count > BURST_RESTOCK_THRESHOLD:
             self._slow_poll_date = datetime.now().strftime("%Y-%m-%d")
@@ -849,10 +873,11 @@ class LightweightStockMonitor:
 
                         self.previous_state = current_state
                         self._save_state()
-                        # Refresh current status for every product that restocked today
-                        for name in self._today_restocks:
-                            if name in current_state:
-                                self._today_restocks[name] = current_state[name]
+                        # Mark packages as out when product goes back to out-of-stock
+                        for name, pkgs in self._today_restock_packages.items():
+                            if not current_state.get(name, False):
+                                for size in pkgs:
+                                    pkgs[size] = False
                         if not changes and not is_initial:
                             self._maybe_send_heartbeat(all_products)
                         self._maybe_send_daily_report()
