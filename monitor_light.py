@@ -240,18 +240,33 @@ def notify_telegram_heartbeat(bot_token: str, chat_id: str, products: List[Produ
         log.warning(f"Telegram heartbeat failed: {e}")
 
 
+def _format_days_out(since_date_str: str, today_str: str) -> str:
+    try:
+        since = datetime.strptime(since_date_str, "%Y-%m-%d").date()
+        today = datetime.strptime(today_str, "%Y-%m-%d").date()
+        days = (today - since).days
+        if days <= 0:
+            return ""
+        return "1w+" if days > 5 else f"{days}d"
+    except Exception:
+        return ""
+
+
 def notify_telegram_daily_report(
     bot_token: str,
     chat_id: str,
     restock_packages: Dict[str, Dict[str, bool]],
     all_state: Dict[str, bool],
+    no_restock_since: Dict[str, str],
     report_dt: datetime,
 ) -> None:
     """Send end-of-day restock summary.
     restock_packages: product → {package → currently_in_stock} (only products restocked today)
     all_state: product → currently_in_stock (all monitored products)
+    no_restock_since: product → YYYY-MM-DD when it last went out of stock (no restock since)
     """
     date_str = report_dt.strftime("%a, %d %b %Y")
+    today_str = report_dt.strftime("%Y-%m-%d")
 
     still_in_rows: List[Tuple[str, Dict[str, bool]]] = []
     cycled_rows: List[Tuple[str, Dict[str, bool]]] = []
@@ -280,7 +295,9 @@ def notify_telegram_daily_report(
         suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
         lines.append(f"🔄 {_format_name(name)}{suffix}")
     for name in never_names:
-        lines.append(f"❌ {_format_name(name)}")
+        since = no_restock_since.get(name, "")
+        counter = f" {_format_days_out(since, today_str)}" if since else ""
+        lines.append(f"❌ {_format_name(name)}{counter}")
 
     items_text = "\n".join(lines) if lines else "  (no products tracked)"
     text = f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n{items_text}"
@@ -608,6 +625,7 @@ class LightweightStockMonitor:
         self._slow_poll_date: Optional[str] = None  # YYYY-MM-DD when burst slow-poll is active
         self._today_date_jst: str = datetime.now(_JST).strftime("%Y-%m-%d")
         self._today_restock_packages: Dict[str, Dict[str, bool]] = {}  # product → {package → currently_in_stock}
+        self._no_restock_since: Dict[str, str] = {}  # product → YYYY-MM-DD (JST) it last went out of stock
         self._daily_report_sent_date: Optional[str] = None  # YYYY-MM-DD (JST) when last daily report was sent
         self.running = True
         self._load_state()
@@ -624,12 +642,28 @@ class LightweightStockMonitor:
         except Exception as e:
             log.warning(f"Could not load state file: {e}")
             return
-        if not isinstance(loaded, dict) or not all(
-            isinstance(k, str) and isinstance(v, bool) for k, v in loaded.items()
-        ):
+        if not isinstance(loaded, dict):
             log.warning(f"State file {self.state_file} has unexpected shape, ignoring")
             return
-        self.previous_state = loaded
+        # v1 format: flat {product: bool}; v2 format: {v: 2, stock: {...}, no_restock_since: {...}}
+        if loaded.get("v") == 2:
+            stock = loaded.get("stock", {})
+            nrs = loaded.get("no_restock_since", {})
+            if not isinstance(stock, dict) or not isinstance(nrs, dict):
+                log.warning(f"State file {self.state_file} v2 fields malformed, ignoring")
+                return
+            self.previous_state = {k: v for k, v in stock.items() if isinstance(k, str) and isinstance(v, bool)}
+            self._no_restock_since = {k: v for k, v in nrs.items() if isinstance(k, str) and isinstance(v, str)}
+        elif all(isinstance(k, str) and isinstance(v, bool) for k, v in loaded.items()):
+            self.previous_state = loaded  # v1 backward compat
+        else:
+            log.warning(f"State file {self.state_file} has unexpected shape, ignoring")
+            return
+        # Seed counter for products already out of stock with no tracked date
+        today = datetime.now(_JST).strftime("%Y-%m-%d")
+        for name, is_in in self.previous_state.items():
+            if not is_in and name not in self._no_restock_since:
+                self._no_restock_since[name] = today
         log.info(f"Loaded state for {len(self.previous_state)} products from {self.state_file}")
 
     def _save_state(self) -> None:
@@ -638,7 +672,7 @@ class LightweightStockMonitor:
         try:
             tmp = self.state_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.previous_state, f)
+                json.dump({"v": 2, "stock": self.previous_state, "no_restock_since": self._no_restock_since}, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.state_file)
@@ -748,7 +782,9 @@ class LightweightStockMonitor:
             notify_telegram_daily_report(
                 self.telegram_bot_token, self.telegram_chat_id,
                 {k: dict(v) for k, v in self._today_restock_packages.items()},
-                dict(self.previous_state), now_jst,
+                dict(self.previous_state),
+                dict(self._no_restock_since),
+                now_jst,
             )
             self._daily_report_sent_date = today
 
@@ -783,6 +819,17 @@ class LightweightStockMonitor:
             else:
                 outofstock_changes.append(change)
 
+        today_jst = datetime.now(_JST).strftime("%Y-%m-%d")
+        for change, variations in restock_items:
+            self._no_restock_since.pop(change.product.name, None)
+            pkgs = self._today_restock_packages.setdefault(change.product.name, {})
+            if variations:
+                for v in variations:
+                    if v.is_in_stock:
+                        pkgs[v.size] = True
+        for change in outofstock_changes:
+            self._no_restock_since[change.product.name] = today_jst
+
         if self.telegram_bot_token and self.telegram_chat_id:
             if restock_items:
                 notify_telegram_restocks(
@@ -800,12 +847,6 @@ class LightweightStockMonitor:
                 )
 
         restock_count = len(restock_items)
-        for change, variations in restock_items:
-            pkgs = self._today_restock_packages.setdefault(change.product.name, {})
-            if variations:
-                for v in variations:
-                    if v.is_in_stock:
-                        pkgs[v.size] = True
 
         if restock_count > BURST_RESTOCK_THRESHOLD:
             self._slow_poll_date = datetime.now().strftime("%Y-%m-%d")
