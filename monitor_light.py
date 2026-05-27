@@ -240,6 +240,20 @@ def notify_telegram_heartbeat(bot_token: str, chat_id: str, products: List[Produ
         log.warning(f"Telegram heartbeat failed: {e}")
 
 
+def _predict_next_restock(restock_dates: List[str]) -> str:
+    """Return '~MMM D' predicted next restock, or '' if fewer than 2 dates recorded."""
+    if len(restock_dates) < 2:
+        return ""
+    try:
+        dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in restock_dates]
+        intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+        avg_days = sum(intervals) / len(intervals)
+        predicted = dates[-1] + timedelta(days=round(avg_days))
+        return f"~{predicted.strftime('%b')} {predicted.day}"
+    except Exception:
+        return ""
+
+
 def _format_days_out(since_date_str: str, today_str: str) -> str:
     try:
         since = datetime.strptime(since_date_str, "%Y-%m-%d").date()
@@ -258,12 +272,14 @@ def notify_telegram_daily_report(
     restock_packages: Dict[str, Dict[str, bool]],
     all_state: Dict[str, bool],
     no_restock_since: Dict[str, str],
+    restock_dates: Dict[str, List[str]],
     report_dt: datetime,
 ) -> None:
     """Send end-of-day restock summary.
     restock_packages: product → {package → currently_in_stock} (only products restocked today)
     all_state: product → currently_in_stock (all monitored products)
-    no_restock_since: product → YYYY-MM-DD when it last went out of stock (no restock since)
+    no_restock_since: product → YYYY-MM-DD when it last went out of stock
+    restock_dates: product → list of historical restock YYYY-MM-DD dates (for prediction)
     """
     date_str = report_dt.strftime("%a, %d %b %Y")
     today_str = report_dt.strftime("%Y-%m-%d")
@@ -292,12 +308,16 @@ def notify_telegram_daily_report(
         suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
         lines.append(f"✅ {_format_name(name)}{suffix}")
     for name, pkgs in cycled_rows:
-        suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
-        lines.append(f"🔄 {_format_name(name)}{suffix}")
+        pkg_suffix = f" : {_pkg_str(pkgs)}" if pkgs else ""
+        prediction = _predict_next_restock(restock_dates.get(name, []))
+        pred_suffix = f" · {prediction}" if prediction else ""
+        lines.append(f"🔄 {_format_name(name)}{pkg_suffix}{pred_suffix}")
     for name in never_names:
         since = no_restock_since.get(name, "")
         counter = f" {_format_days_out(since, today_str)}" if since else ""
-        lines.append(f"❌ {_format_name(name)}{counter}")
+        prediction = _predict_next_restock(restock_dates.get(name, []))
+        pred_suffix = f" · {prediction}" if prediction else ""
+        lines.append(f"❌ {_format_name(name)}{counter}{pred_suffix}")
 
     items_text = "\n".join(lines) if lines else "  (no products tracked)"
     text = f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n{items_text}"
@@ -626,6 +646,7 @@ class LightweightStockMonitor:
         self._today_date_jst: str = datetime.now(_JST).strftime("%Y-%m-%d")
         self._today_restock_packages: Dict[str, Dict[str, bool]] = {}  # product → {package → currently_in_stock}
         self._no_restock_since: Dict[str, str] = {}  # product → YYYY-MM-DD (JST) it last went out of stock
+        self._restock_dates: Dict[str, List[str]] = {}  # product → list of restock YYYY-MM-DD (JST), capped at 10
         self._daily_report_sent_date: Optional[str] = None  # YYYY-MM-DD (JST) when last daily report was sent
         self.running = True
         self._load_state()
@@ -649,11 +670,17 @@ class LightweightStockMonitor:
         if loaded.get("v") == 2:
             stock = loaded.get("stock", {})
             nrs = loaded.get("no_restock_since", {})
-            if not isinstance(stock, dict) or not isinstance(nrs, dict):
+            rd = loaded.get("restock_dates", {})
+            if not isinstance(stock, dict) or not isinstance(nrs, dict) or not isinstance(rd, dict):
                 log.warning(f"State file {self.state_file} v2 fields malformed, ignoring")
                 return
             self.previous_state = {k: v for k, v in stock.items() if isinstance(k, str) and isinstance(v, bool)}
             self._no_restock_since = {k: v for k, v in nrs.items() if isinstance(k, str) and isinstance(v, str)}
+            self._restock_dates = {
+                k: [d for d in v if isinstance(d, str)]
+                for k, v in rd.items()
+                if isinstance(k, str) and isinstance(v, list)
+            }
         elif all(isinstance(k, str) and isinstance(v, bool) for k, v in loaded.items()):
             self.previous_state = loaded  # v1 backward compat
         else:
@@ -672,7 +699,12 @@ class LightweightStockMonitor:
         try:
             tmp = self.state_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"v": 2, "stock": self.previous_state, "no_restock_since": self._no_restock_since}, f)
+                json.dump({
+                    "v": 2,
+                    "stock": self.previous_state,
+                    "no_restock_since": self._no_restock_since,
+                    "restock_dates": self._restock_dates,
+                }, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.state_file)
@@ -784,6 +816,7 @@ class LightweightStockMonitor:
                 {k: dict(v) for k, v in self._today_restock_packages.items()},
                 dict(self.previous_state),
                 dict(self._no_restock_since),
+                {k: list(v) for k, v in self._restock_dates.items()},
                 now_jst,
             )
             self._daily_report_sent_date = today
@@ -821,8 +854,14 @@ class LightweightStockMonitor:
 
         today_jst = datetime.now(_JST).strftime("%Y-%m-%d")
         for change, variations in restock_items:
-            self._no_restock_since.pop(change.product.name, None)
-            pkgs = self._today_restock_packages.setdefault(change.product.name, {})
+            name = change.product.name
+            self._no_restock_since.pop(name, None)
+            dates = self._restock_dates.setdefault(name, [])
+            if not dates or dates[-1] != today_jst:
+                dates.append(today_jst)
+            if len(dates) > 10:
+                dates[:] = dates[-10:]
+            pkgs = self._today_restock_packages.setdefault(name, {})
             if variations:
                 for v in variations:
                     if v.is_in_stock:
