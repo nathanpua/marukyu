@@ -244,23 +244,26 @@ def notify_telegram_daily_report(
     bot_token: str,
     chat_id: str,
     restocks: Dict[str, bool],
+    all_state: Dict[str, bool],
     report_dt: datetime,
 ) -> None:
-    """Send end-of-day restock summary. restocks maps product name → currently in stock."""
+    """Send end-of-day restock summary.
+    restocks: name → currently in stock (only products restocked today)
+    all_state: name → currently in stock (all monitored products)
+    """
     date_str = report_dt.strftime("%a, %d %b %Y")
-    if restocks:
-        lines = []
-        for name in sorted(restocks):
-            still_in = restocks[name]
-            icon = "✅" if still_in else "\U0001f504"
-            status = "still in stock" if still_in else "back out of stock"
-            lines.append(f"  {icon} {_format_name(name)} — {status}")
-        items_text = "\n".join(lines)
-    else:
-        items_text = "  (none today)"
+    still_in = {n for n, v in restocks.items() if v}
+    back_out = {n for n, v in restocks.items() if not v}
+    never = {n for n in all_state if n not in restocks}
+    lines = (
+        [f"✅ {_format_name(n)}" for n in sorted(still_in)]
+        + [f"🔄 {_format_name(n)}" for n in sorted(back_out)]
+        + [f"❌ {_format_name(n)}" for n in sorted(never)]
+    )
+    items_text = "\n".join(lines) if lines else "  (no products tracked)"
     text = (
         f"\U0001f4ca <b>Daily Report — {html.escape(date_str)}</b>\n\n"
-        f"<b>Restocked today:</b>\n{items_text}"
+        f"{items_text}"
     )
     try:
         _telegram_post(bot_token, chat_id, text)
@@ -725,7 +728,7 @@ class LightweightStockMonitor:
         if now_jst.hour >= DAILY_REPORT_HOUR_JST and today != self._daily_report_sent_date:
             notify_telegram_daily_report(
                 self.telegram_bot_token, self.telegram_chat_id,
-                dict(self._today_restocks), now_jst,
+                dict(self._today_restocks), dict(self.previous_state), now_jst,
             )
             self._daily_report_sent_date = today
 
