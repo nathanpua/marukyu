@@ -113,6 +113,7 @@ class VariationStock:
     sku: str
     is_in_stock: bool
     availability_text: str
+    price: Optional[float] = None
 
 
 def _parse_url_arg(arg: str) -> UrlConfig:
@@ -268,6 +269,28 @@ def notify_telegram_daily_report(
         log.warning(f"Daily report failed: {e}")
 
 
+def _gram_weight(size_name: str) -> Optional[int]:
+    m = re.match(r'(\d+)\s*g\b', size_name, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _format_unit_price(size_name: str, price: Optional[float]) -> str:
+    if price is None:
+        return ""
+    g = _gram_weight(size_name)
+    if not g:
+        return f"\u00a5{price:,.0f}"
+    return f"\u00a5{int(round(price / g))}/g"
+
+
+def _normalize_avail(text: str) -> str:
+    if not text or text.lower() in ("in stock", "available", "in stock"):
+        return ""
+    if "limit" in text.lower():
+        return "limited"
+    return text
+
+
 def notify_telegram(
     bot_token: str,
     chat_id: str,
@@ -277,17 +300,24 @@ def notify_telegram(
     emoji = "\u2705" if change.new_status == "In Stock" else "\u274c"
     text = (
         f"{emoji} <b>{_format_name(change.product.name)}</b>\n"
-        f"Price: {html.escape(change.product.price)}\n"
         f"Status: {change.old_status} \u2192 {change.new_status}\n"
     )
     if variations and change.new_status == "In Stock":
-        text += "\n<b>Package sizes:</b>\n"
-        for v in variations:
-            icon = "\u2705" if v.is_in_stock else "\u274c"
-            line = f"  {icon} {html.escape(v.size)}"
-            if v.availability_text:
-                line += f" \u2014 {html.escape(v.availability_text)}"
+        in_stock = [v for v in variations if v.is_in_stock]
+        out_of_stock = [v for v in variations if not v.is_in_stock]
+        text += "\n"
+        for v in in_stock:
+            unit = _format_unit_price(v.size, v.price)
+            note = _normalize_avail(v.availability_text)
+            line = f"\u2705 {html.escape(v.size)}"
+            if unit:
+                line += f" \u2014 {unit}"
+            if note:
+                line += f" ({html.escape(note)})"
             text += line + "\n"
+        if out_of_stock:
+            sizes_str = " \u00b7 ".join(html.escape(v.size) for v in out_of_stock)
+            text += f"\u274c {sizes_str}\n"
     text += f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
     try:
         _telegram_post(bot_token, chat_id, text)
@@ -495,12 +525,14 @@ def fetch_variation_stock(
             data = ajax.json()
             if not isinstance(data, dict):
                 continue
+            price_raw = data.get("display_price")
             results.append(VariationStock(
                 size=size_name,
                 variation_id=data.get("variation_id"),
                 sku=data.get("sku", ""),
                 is_in_stock=bool(data.get("is_in_stock", False)),
                 availability_text=_clean_html(data.get("availability_html", "")),
+                price=float(price_raw) if price_raw is not None else None,
             ))
         except Exception as e:
             log.debug(f"Variation AJAX failed for '{size_name}': {e}")
