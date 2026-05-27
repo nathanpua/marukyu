@@ -269,59 +269,77 @@ def notify_telegram_daily_report(
         log.warning(f"Daily report failed: {e}")
 
 
-def _gram_weight(size_name: str) -> Optional[int]:
-    m = re.match(r'(\d+)\s*g\b', size_name, re.IGNORECASE)
-    return int(m.group(1)) if m else None
-
-
-def _format_unit_price(size_name: str, price: Optional[float]) -> str:
+def _format_price(price: Optional[float]) -> str:
     if price is None:
         return ""
-    g = _gram_weight(size_name)
-    if not g:
-        return f"\u00a5{price:,.0f}"
-    return f"\u00a5{int(round(price / g))}/g"
+    return f"\u00a5{price:,.0f}"
 
 
 def _normalize_avail(text: str) -> str:
-    if not text or text.lower() in ("in stock", "available", "in stock"):
+    if not text or text.lower() in ("in stock", "available"):
         return ""
     if "limit" in text.lower():
         return "limited"
     return text
 
 
-def notify_telegram(
+def _format_variation_block(variations: List[VariationStock]) -> str:
+    in_stock = [v for v in variations if v.is_in_stock]
+    out_of_stock = [v for v in variations if not v.is_in_stock]
+    lines = []
+    for v in in_stock:
+        line = f"\u2705 {html.escape(v.size)}"
+        price_str = _format_price(v.price)
+        if price_str:
+            line += f" \u2014 {price_str}"
+        note = _normalize_avail(v.availability_text)
+        if note:
+            line += f" ({html.escape(note)})"
+        lines.append(line)
+    if out_of_stock:
+        sizes_str = " \u00b7 ".join(html.escape(v.size) for v in out_of_stock)
+        lines.append(f"\u274c {sizes_str}")
+    return "\n".join(lines)
+
+
+def notify_telegram_restocks(
+    bot_token: str,
+    chat_id: str,
+    items: "List[Tuple[StockChange, Optional[List[VariationStock]]]]",
+) -> None:
+    if len(items) == 1:
+        change, variations = items[0]
+        text = f"\u2705 <b>{_format_name(change.product.name)}</b>\nOut of Stock \u2192 In Stock\n"
+        if variations:
+            text += "\n" + _format_variation_block(variations) + "\n"
+        text += f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
+    else:
+        text = f"\ud83d\udce6 <b>{len(items)} products restocked</b>\n"
+        for change, variations in items:
+            text += f'\n\u2705 <b><a href="{html.escape(change.product.url)}">{_format_name(change.product.name)}</a></b>\n'
+            if variations:
+                text += _format_variation_block(variations) + "\n"
+    try:
+        _telegram_post(bot_token, chat_id, text)
+        names = ", ".join(c.product.name for c, _ in items)
+        log.info(f"Telegram restock notification sent: {names}")
+    except Exception as e:
+        log.warning(f"Telegram restock notification failed: {e}")
+
+
+def notify_telegram_outofstock(
     bot_token: str,
     chat_id: str,
     change: StockChange,
-    variations: Optional[List[VariationStock]] = None,
 ) -> None:
-    emoji = "\u2705" if change.new_status == "In Stock" else "\u274c"
     text = (
-        f"{emoji} <b>{_format_name(change.product.name)}</b>\n"
-        f"Status: {change.old_status} \u2192 {change.new_status}\n"
+        f"\u274c <b>{_format_name(change.product.name)}</b>\n"
+        f"In Stock \u2192 Out of Stock\n"
+        f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
     )
-    if variations and change.new_status == "In Stock":
-        in_stock = [v for v in variations if v.is_in_stock]
-        out_of_stock = [v for v in variations if not v.is_in_stock]
-        text += "\n"
-        for v in in_stock:
-            unit = _format_unit_price(v.size, v.price)
-            note = _normalize_avail(v.availability_text)
-            line = f"\u2705 {html.escape(v.size)}"
-            if unit:
-                line += f" \u2014 {unit}"
-            if note:
-                line += f" ({html.escape(note)})"
-            text += line + "\n"
-        if out_of_stock:
-            sizes_str = " \u00b7 ".join(html.escape(v.size) for v in out_of_stock)
-            text += f"\u274c {sizes_str}\n"
-    text += f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
     try:
         _telegram_post(bot_token, chat_id, text)
-        log.info(f"Telegram notification sent for {change.product.name}")
+        log.info(f"Telegram out-of-stock notification sent for {change.product.name}")
     except Exception as e:
         log.warning(f"Telegram notification failed: {e}")
 
@@ -709,50 +727,55 @@ class LightweightStockMonitor:
             self._daily_report_sent_date = today
 
     def _handle_changes(self, changes: List[StockChange]) -> None:
+        restock_items: List[Tuple[StockChange, Optional[List[VariationStock]]]] = []
+        outofstock_changes: List[StockChange] = []
+
         for change in changes:
             arrow = "IN" if change.new_status == "In Stock" else "OUT"
             log.info(f"[{arrow}] {change.product.name}: {change.old_status} -> {change.new_status}")
 
-            variations: Optional[List[VariationStock]] = None
-            if (
-                self.telegram_bot_token
-                and self.telegram_chat_id
-                and change.new_status == "In Stock"
-                and change.product.url
-                and self.session_cookies
-            ):
-                try:
-                    size_terms = self._get_size_terms()
-                    if size_terms:
-                        variations = fetch_variation_stock(
-                            change.product.url, self.session_cookies, size_terms
-                        )
-                        if variations:
-                            n_in = sum(1 for v in variations if v.is_in_stock)
-                            log.info(
-                                f"Variation stock for {change.product.name}: "
-                                f"{n_in}/{len(variations)} in stock"
+            if change.new_status == "In Stock":
+                variations: Optional[List[VariationStock]] = None
+                if change.product.url and self.session_cookies:
+                    try:
+                        size_terms = self._get_size_terms()
+                        if size_terms:
+                            variations = fetch_variation_stock(
+                                change.product.url, self.session_cookies, size_terms
                             )
-                        else:
-                            log.warning(f"No variation data returned for {change.product.name}")
-                except Exception as e:
-                    log.warning(f"Variation check failed for {change.product.name}: {e}")
+                            if variations:
+                                n_in = sum(1 for v in variations if v.is_in_stock)
+                                log.info(
+                                    f"Variation stock for {change.product.name}: "
+                                    f"{n_in}/{len(variations)} in stock"
+                                )
+                            else:
+                                log.warning(f"No variation data returned for {change.product.name}")
+                    except Exception as e:
+                        log.warning(f"Variation check failed for {change.product.name}: {e}")
+                restock_items.append((change, variations))
+            else:
+                outofstock_changes.append(change)
 
-            if self.telegram_bot_token and self.telegram_chat_id:
-                notify_telegram(
-                    self.telegram_bot_token, self.telegram_chat_id, change, variations
+        if self.telegram_bot_token and self.telegram_chat_id:
+            if restock_items:
+                notify_telegram_restocks(
+                    self.telegram_bot_token, self.telegram_chat_id, restock_items
                 )
-            elif self.macos_notify:
+            for change in outofstock_changes:
+                notify_telegram_outofstock(
+                    self.telegram_bot_token, self.telegram_chat_id, change
+                )
+        elif self.macos_notify:
+            for change in changes:
                 notify_macos(
                     "Marukyu Stock Alert",
                     f"{change.product.name} is now {change.new_status}! ({change.product.price})",
                 )
 
-        restock_count = 0
-        for c in changes:
-            if c.new_status == "In Stock":
-                restock_count += 1
-                self._today_restocks[c.product.name] = True
+        restock_count = len(restock_items)
+        for change, _ in restock_items:
+            self._today_restocks[change.product.name] = True
 
         if restock_count > BURST_RESTOCK_THRESHOLD:
             self._slow_poll_date = datetime.now().strftime("%Y-%m-%d")
