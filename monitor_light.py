@@ -814,8 +814,12 @@ class LightweightStockMonitor:
                     slow = " [burst slow-poll]" if self._slow_poll_date else ""
                     log.info(f"Next check in {sleep_time:.0f}s{slow}")
                     sleep_until = time.time() + sleep_time
+                    last_report_check = time.time()
                     while self.running and time.time() < sleep_until:
                         time.sleep(1)
+                        if time.time() - last_report_check >= 60:
+                            self._maybe_send_daily_report()
+                            last_report_check = time.time()
 
         finally:
             log.info("Shutting down...")
