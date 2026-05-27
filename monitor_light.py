@@ -287,15 +287,18 @@ def _format_variation_block(variations: List[VariationStock]) -> str:
     in_stock = [v for v in variations if v.is_in_stock]
     out_of_stock = [v for v in variations if not v.is_in_stock]
     lines = []
-    for v in in_stock:
-        line = f"\u2705 {html.escape(v.size)}"
-        price_str = _format_price(v.price)
-        if price_str:
-            line += f" \u2014 {price_str}"
-        note = _normalize_avail(v.availability_text)
-        if note:
-            line += f" ({html.escape(note)})"
-        lines.append(line)
+    if in_stock:
+        parts = []
+        for v in in_stock:
+            part = html.escape(v.size)
+            price_str = _format_price(v.price)
+            if price_str:
+                part += f" \u2014 {price_str}"
+            note = _normalize_avail(v.availability_text)
+            if note:
+                part += f" ({html.escape(note)})"
+            parts.append(part)
+        lines.append("\u2705 " + " \u00b7 ".join(parts))
     if out_of_stock:
         sizes_str = " \u00b7 ".join(html.escape(v.size) for v in out_of_stock)
         lines.append(f"\u274c {sizes_str}")
