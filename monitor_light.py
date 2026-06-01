@@ -289,14 +289,13 @@ def notify_telegram_daily_report(
     never_names: List[str] = []
 
     for name in sorted(all_state.keys()):
-        if name not in restock_packages:
-            never_names.append(name)
-            continue
-        pkgs = restock_packages[name]
-        if any(v for v in pkgs.values()):
-            still_in_rows.append((name, pkgs))
-        else:
+        pkgs = restock_packages.get(name)
+        if all_state[name]:
+            still_in_rows.append((name, pkgs or {}))
+        elif pkgs is not None:
             cycled_rows.append((name, pkgs))
+        else:
+            never_names.append(name)
 
     def _pkg_str(pkgs: Dict[str, bool]) -> str:
         parts = [f"✅ {p}" for p, v in sorted(pkgs.items()) if v]
@@ -371,10 +370,9 @@ def notify_telegram_restocks(
 ) -> None:
     if len(items) == 1:
         change, variations = items[0]
-        text = f"\u2705 <b>{_format_name(change.product.name)}</b>\nOut of Stock \u2192 In Stock\n"
+        text = f'\u2705 <b><a href="{html.escape(change.product.url)}">{_format_name(change.product.name)}</a></b>'
         if variations:
-            text += "\n" + _format_variation_block(variations) + "\n"
-        text += f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
+            text += "\n" + _format_variation_block(variations)
     else:
         text = f"\ud83d\udce6 <b>{len(items)} products restocked</b>\n"
         for change, variations in items:
@@ -394,11 +392,7 @@ def notify_telegram_outofstock(
     chat_id: str,
     change: StockChange,
 ) -> None:
-    text = (
-        f"\u274c <b>{_format_name(change.product.name)}</b>\n"
-        f"In Stock \u2192 Out of Stock\n"
-        f'\n<a href="{html.escape(change.product.url)}">View Product</a>'
-    )
+    text = f"\u274c <b>{_format_name(change.product.name)}</b>"
     try:
         _telegram_post(bot_token, chat_id, text)
         log.info(f"Telegram out-of-stock notification sent for {change.product.name}")
@@ -686,6 +680,16 @@ class LightweightStockMonitor:
         else:
             log.warning(f"State file {self.state_file} has unexpected shape, ignoring")
             return
+        trp = loaded.get("today_restock_packages", {})
+        if isinstance(trp, dict) and trp.get("date") == datetime.now(_JST).strftime("%Y-%m-%d"):
+            pkgs = trp.get("packages", {})
+            if isinstance(pkgs, dict):
+                self._today_restock_packages = {
+                    k: {sk: bool(sv) for sk, sv in v.items()}
+                    for k, v in pkgs.items()
+                    if isinstance(k, str) and isinstance(v, dict)
+                }
+
         # Seed counter for products already out of stock with no tracked date
         today = datetime.now(_JST).strftime("%Y-%m-%d")
         for name, is_in in self.previous_state.items():
@@ -704,6 +708,10 @@ class LightweightStockMonitor:
                     "stock": self.previous_state,
                     "no_restock_since": self._no_restock_since,
                     "restock_dates": self._restock_dates,
+                    "today_restock_packages": {
+                        "date": self._today_date_jst,
+                        "packages": {k: dict(v) for k, v in self._today_restock_packages.items()},
+                    },
                 }, f)
                 f.flush()
                 os.fsync(f.fileno())
