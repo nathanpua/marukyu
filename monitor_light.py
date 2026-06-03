@@ -390,12 +390,14 @@ def notify_telegram_restocks(
 def notify_telegram_outofstock(
     bot_token: str,
     chat_id: str,
-    change: StockChange,
+    changes: "List[StockChange]",
 ) -> None:
-    text = f"\u274c <b>{_format_name(change.product.name)}</b>"
+    names_str = " \u00b7 ".join(f"<b>{_format_name(c.product.name)}</b>" for c in changes)
+    text = f"\u274c {names_str}"
     try:
         _telegram_post(bot_token, chat_id, text)
-        log.info(f"Telegram out-of-stock notification sent for {change.product.name}")
+        names = ", ".join(c.product.name for c in changes)
+        log.info(f"Telegram out-of-stock notification sent for {names}")
     except Exception as e:
         log.warning(f"Telegram notification failed: {e}")
 
@@ -882,9 +884,9 @@ class LightweightStockMonitor:
                 notify_telegram_restocks(
                     self.telegram_bot_token, self.telegram_chat_id, restock_items
                 )
-            for change in outofstock_changes:
+            if outofstock_changes:
                 notify_telegram_outofstock(
-                    self.telegram_bot_token, self.telegram_chat_id, change
+                    self.telegram_bot_token, self.telegram_chat_id, outofstock_changes
                 )
         elif self.macos_notify:
             for change in changes:
