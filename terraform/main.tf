@@ -10,9 +10,9 @@ terraform {
     }
   }
 
-  backend "local" {
-    path = "terraform.tfstate"
-  }
+  # Backend config supplied via backend.hcl or -backend-config flags.
+  # See backend.hcl.example for the required values.
+  backend "s3" {}
 }
 
 provider "aws" {

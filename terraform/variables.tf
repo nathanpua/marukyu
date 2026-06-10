@@ -7,7 +7,7 @@ variable "instance_type" {
 }
 
 variable "poll_interval" {
-  default     = 600
+  default     = 60
   description = "Base poll interval in seconds"
 }
 
