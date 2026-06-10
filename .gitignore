@@ -1,13 +1,22 @@
 # Secrets
-monitor-key.pem
 *.pem
+
+# AI agent configs
+.claude/
+.cursor/
+.aider*
+.copilot/
 
 # Terraform
 terraform/.terraform/
+terraform/bootstrap/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
-terraform/*.lock.hcl
+terraform/bootstrap/*.tfstate
+terraform/bootstrap/*.tfstate.backup
+terraform/tfplan
 terraform/lambda/*.zip
+terraform/backend.hcl
 
 # Python
 __pycache__/

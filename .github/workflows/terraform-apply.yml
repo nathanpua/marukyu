@@ -1,0 +1,60 @@
+name: terraform apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation token
+        run: |
+          if [[ "${{ inputs.confirm }}" != "APPLY" ]]; then
+            echo "::error::Refusing to apply: input 'confirm' must equal APPLY (got '${{ inputs.confirm }}')"
+            exit 1
+          fi
+
+  apply:
+    name: apply
+    needs: guard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ap-southeast-1
+      TF_VAR_telegram_bot_token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TF_VAR_telegram_chat_ids: ${{ secrets.TELEGRAM_CHAT_IDS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=marukyu/terraform.tfstate" \
+            -backend-config="region=ap-southeast-1" \
+            -backend-config="dynamodb_table=marukyu-tfstate-lock" \
+            -backend-config="encrypt=true"
+
+      - name: terraform plan
+        run: terraform plan -no-color -input=false -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -no-color -input=false tfplan

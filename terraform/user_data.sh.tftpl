@@ -5,11 +5,16 @@ exec > >(tee -a /var/log/monitor-setup.log) 2>&1
 echo "=== Setup started at $(date) ==="
 
 echo "[1/11] Creating 1GB swap file..."
-fallocate -l 1G /swapfile
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-echo '/swapfile none swap sw 0 0' >> /etc/fstab
+if [ ! -f /swapfile ]; then
+    fallocate -l 1G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+else
+    echo "WARN: /swapfile already exists, skipping swap creation"
+    swapon /swapfile 2>/dev/null || true
+fi
 echo 'vm.swappiness=10' >> /etc/sysctl.conf
 sysctl -p
 free -h
@@ -17,7 +22,7 @@ free -h
 echo "[2/11] Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get upgrade -y
+apt-get upgrade -y || echo "WARN: apt-get upgrade returned non-zero, continuing"
 apt-get install -y \
     python3 python3-pip python3-venv \
     wget curl git unzip \
@@ -37,14 +42,15 @@ sudo -u monitor python3 -m venv /opt/marukyu-monitor/venv
 sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --upgrade pip
 
 echo "[5/11] Installing Python dependencies..."
-sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install \
+sudo -u monitor /opt/marukyu-monitor/venv/bin/pip install --retries 5 \
     'scrapling>=0.4.7' \
     'curl_cffi>=0.15.0' \
     'patchright' \
     'playwright' \
     'msgspec' \
     'camoufox' \
-    'click'
+    'click' \
+    'boto3'
 
 echo "[6/11] Installing Chromium browser for Scrapling..."
 sudo -u monitor HOME=/home/monitor /opt/marukyu-monitor/venv/bin/python -m patchright install chromium || true
@@ -55,9 +61,12 @@ ${monitor_script}
 MONITOR_SCRIPT
 
 echo "[8/11] Installing CloudWatch Agent..."
-wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i /tmp/amazon-cloudwatch-agent.deb
-rm /tmp/amazon-cloudwatch-agent.deb
+wget -q -O /tmp/amazon-cloudwatch-agent.deb https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb \
+    || { echo "WARN: CloudWatch agent download failed, skipping CW agent install"; rm -f /tmp/amazon-cloudwatch-agent.deb; }
+if [ -f /tmp/amazon-cloudwatch-agent.deb ]; then
+    dpkg -i /tmp/amazon-cloudwatch-agent.deb || apt-get install -fy
+    rm /tmp/amazon-cloudwatch-agent.deb
+fi
 
 echo "[9/11] Configuring CloudWatch Agent..."
 mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
@@ -79,10 +88,22 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWCO
   }
 }
 CWCONFIG
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+if [ -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+        || echo "WARN: CloudWatch agent fetch-config returned non-zero, continuing"
+fi
 
 echo "[10/11] Creating systemd service..."
+%{ if telegram_enabled }
+# Fetch Telegram credentials from SSM Parameter Store
+TELEGRAM_BOT_TOKEN=$(/opt/marukyu-monitor/venv/bin/python3 -c "import boto3; print(boto3.client('ssm', region_name='${region}').get_parameter(Name='${ssm_bot_token_param}', WithDecryption=True)['Parameter']['Value'])")
+TELEGRAM_CHAT_IDS=$(/opt/marukyu-monitor/venv/bin/python3 -c "import boto3; print(boto3.client('ssm', region_name='${region}').get_parameter(Name='${ssm_chat_ids_param}', WithDecryption=True)['Parameter']['Value'])")
+TELEGRAM_FLAGS="--telegram-bot-token $TELEGRAM_BOT_TOKEN --telegram-chat-ids $TELEGRAM_CHAT_IDS"
+%{ else }
+TELEGRAM_FLAGS=""
+%{ endif }
+
 cat > /etc/systemd/system/marukyu-monitor.service << SERVICEFILE
 [Unit]
 Description=Marukyu Matcha Stock Monitor
@@ -94,7 +115,7 @@ Type=simple
 User=monitor
 Group=monitor
 WorkingDirectory=/opt/marukyu-monitor
-ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py --interval ${poll_interval}${telegram_flags}
+ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py --url "${monitor_url}" --interval ${poll_interval} $TELEGRAM_FLAGS
 Restart=always
 RestartSec=30
 StandardOutput=append:/var/log/marukyu-monitor/monitor.log

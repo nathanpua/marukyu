@@ -1,0 +1,9 @@
+# Copy to backend.hcl and fill in values from `terraform output` in bootstrap/.
+#
+# Then: terraform init -backend-config=backend.hcl
+
+bucket         = "marukyu-tfstate-<YOUR_AWS_ACCOUNT_ID>"
+key            = "marukyu/terraform.tfstate"
+region         = "ap-southeast-1"
+dynamodb_table = "marukyu-tfstate-lock"
+encrypt        = true
