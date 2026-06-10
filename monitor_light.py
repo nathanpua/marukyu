@@ -10,7 +10,7 @@ Architecture:
 3. Every 25 min: re-open Chromium to refresh cf_clearance cookies
 
 Usage:
-    python monitor_light.py [--interval SECONDS] [--telegram-bot-token TOKEN] [--telegram-chat-id ID] [--debug]
+    python monitor_light.py [--interval SECONDS] [--telegram-bot-token TOKEN] [--telegram-chat-ids ID1,ID2,...] [--debug]
 """
 
 import argparse
@@ -259,13 +259,13 @@ class LightweightStockMonitor:
         url: str = DEFAULT_URL,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         telegram_bot_token: Optional[str] = None,
-        telegram_chat_id: Optional[str] = None,
+        telegram_chat_ids: Optional[List[str]] = None,
         macos_notify: bool = False,
     ):
         self.url = url
         self.poll_interval = poll_interval
         self.telegram_bot_token = telegram_bot_token
-        self.telegram_chat_id = telegram_chat_id
+        self.telegram_chat_ids = telegram_chat_ids or []
         self.macos_notify = macos_notify
         self.previous_state: Dict[str, bool] = {}
         self.session_cookies: Optional[SessionCookies] = None
@@ -330,8 +330,9 @@ class LightweightStockMonitor:
             arrow = "IN" if change.new_status == "In Stock" else "OUT"
             log.info(f"[{arrow}] {change.product.name}: {change.old_status} -> {change.new_status}")
 
-            if self.telegram_bot_token and self.telegram_chat_id:
-                notify_telegram(self.telegram_bot_token, self.telegram_chat_id, change)
+            if self.telegram_bot_token and self.telegram_chat_ids:
+                for chat_id in self.telegram_chat_ids:
+                    notify_telegram(self.telegram_bot_token, chat_id, change)
             elif self.macos_notify:
                 notify_macos(
                     "Marukyu Stock Alert",
@@ -430,7 +431,7 @@ def main():
     parser.add_argument("--url", default=DEFAULT_URL, help="URL to monitor")
     parser.add_argument("--interval", type=int, default=DEFAULT_POLL_INTERVAL)
     parser.add_argument("--telegram-bot-token", default=None, help="Telegram bot token")
-    parser.add_argument("--telegram-chat-id", default=None, help="Telegram chat ID")
+    parser.add_argument("--telegram-chat-ids", default=None, help="Comma-separated Telegram chat IDs")
     parser.add_argument("--macos-notify", action="store_true", help="Enable macOS notifications")
     parser.add_argument("--once", action="store_true", help="Single fetch for testing")
     parser.add_argument("--debug", action="store_true")
@@ -443,7 +444,7 @@ def main():
         url=args.url,
         poll_interval=args.interval,
         telegram_bot_token=args.telegram_bot_token,
-        telegram_chat_id=args.telegram_chat_id,
+        telegram_chat_ids=args.telegram_chat_ids.split(",") if args.telegram_chat_ids else None,
         macos_notify=args.macos_notify,
     )
 

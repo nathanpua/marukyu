@@ -26,9 +26,9 @@ variable "telegram_bot_token" {
   description = "Telegram bot token for stock change notifications"
 }
 
-variable "telegram_chat_id" {
-  type        = string
+variable "telegram_chat_ids" {
+  type        = list(string)
   sensitive   = true
-  default     = ""
-  description = "Telegram chat ID for stock change notifications"
+  default     = []
+  description = "List of Telegram chat IDs for stock change notifications"
 }

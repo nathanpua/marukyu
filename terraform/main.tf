@@ -176,7 +176,7 @@ resource "aws_instance" "monitor" {
   user_data_base64 = base64gzip(templatefile("${path.module}/user_data.sh.tftpl", {
     monitor_script      = file("${path.module}/../monitor_light.py")
     poll_interval       = var.poll_interval
-    telegram_flags   = var.telegram_bot_token != "" ? " --telegram-bot-token ${var.telegram_bot_token} --telegram-chat-id ${var.telegram_chat_id}" : ""
+    telegram_flags   = var.telegram_bot_token != "" ? " --telegram-bot-token ${var.telegram_bot_token} --telegram-chat-ids ${join(",", var.telegram_chat_ids)}" : ""
     log_group_name      = aws_cloudwatch_log_group.monitor.name
   }))
 
