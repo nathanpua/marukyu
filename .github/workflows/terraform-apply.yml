@@ -58,3 +58,40 @@ jobs:
 
       - name: terraform apply
         run: terraform apply -no-color -input=false tfplan
+
+      - name: Restart monitor service
+        if: always()
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=marukyu-matcha-monitor" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "::warning::No running instance found — may be stopped by scheduler"
+            exit 0
+          fi
+
+          echo "Restarting service on $INSTANCE_ID"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Restart monitor after terraform apply" \
+            --parameters 'commands=["systemctl restart marukyu-monitor"]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          for i in $(seq 1 12); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "[$i/12] $STATUS"
+            case "$STATUS" in
+              Success) echo "Service restarted"; exit 0;;
+              Failed|TimedOut|Cancelled) echo "::error::Restart failed: $STATUS"; exit 1;;
+            esac
+          done
+          echo "::warning::Timed out waiting for restart (60s)"

@@ -94,17 +94,37 @@ if [ -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
         || echo "WARN: CloudWatch agent fetch-config returned non-zero, continuing"
 fi
 
-echo "[10/11] Creating systemd service..."
-%{ if telegram_enabled }
-# Fetch Telegram credentials from SSM Parameter Store
-TELEGRAM_BOT_TOKEN=$(/opt/marukyu-monitor/venv/bin/python3 -c "import boto3; print(boto3.client('ssm', region_name='${region}').get_parameter(Name='${ssm_bot_token_param}', WithDecryption=True)['Parameter']['Value'])")
-TELEGRAM_CHAT_IDS=$(/opt/marukyu-monitor/venv/bin/python3 -c "import boto3; print(boto3.client('ssm', region_name='${region}').get_parameter(Name='${ssm_chat_ids_param}', WithDecryption=True)['Parameter']['Value'])")
-TELEGRAM_FLAGS="--telegram-bot-token $TELEGRAM_BOT_TOKEN --telegram-chat-ids $TELEGRAM_CHAT_IDS"
-%{ else }
+echo "[10/11] Creating start script and systemd service..."
+
+# Wrapper script fetches Telegram credentials from SSM on every start,
+# so restarting the service picks up new secrets without instance replacement.
+cat > /opt/marukyu-monitor/start_monitor.sh << 'WRAPPER'
+#!/bin/bash
+set -uo pipefail
+
 TELEGRAM_FLAGS=""
+%{ if telegram_enabled }
+TELEGRAM_FLAGS=$(/opt/marukyu-monitor/venv/bin/python3 -c "
+import boto3, sys
+try:
+    ssm = boto3.client('ssm', region_name='${region}')
+    token = ssm.get_parameter(Name='${ssm_bot_token_param}', WithDecryption=True)['Parameter']['Value']
+    chat_ids = ssm.get_parameter(Name='${ssm_chat_ids_param}', WithDecryption=True)['Parameter']['Value']
+    print(f'--telegram-bot-token {token} --telegram-chat-ids {chat_ids}')
+except Exception as e:
+    print(f'WARN: SSM fetch failed: {e}', file=sys.stderr)
+")
 %{ endif }
 
-cat > /etc/systemd/system/marukyu-monitor.service << SERVICEFILE
+exec /opt/marukyu-monitor/venv/bin/python /opt/marukyu-monitor/monitor_light.py \
+    --url "${monitor_url}" \
+    --interval ${poll_interval} \
+    $TELEGRAM_FLAGS
+WRAPPER
+chmod +x /opt/marukyu-monitor/start_monitor.sh
+chown monitor:monitor /opt/marukyu-monitor/start_monitor.sh
+
+cat > /etc/systemd/system/marukyu-monitor.service << 'SERVICEFILE'
 [Unit]
 Description=Marukyu Matcha Stock Monitor
 After=network-online.target
@@ -115,7 +135,7 @@ Type=simple
 User=monitor
 Group=monitor
 WorkingDirectory=/opt/marukyu-monitor
-ExecStart=/opt/marukyu-monitor/venv/bin/python monitor_light.py --url "${monitor_url}" --interval ${poll_interval} $TELEGRAM_FLAGS
+ExecStart=/opt/marukyu-monitor/start_monitor.sh
 Restart=always
 RestartSec=30
 StandardOutput=append:/var/log/marukyu-monitor/monitor.log
