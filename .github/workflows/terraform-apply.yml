@@ -72,6 +72,24 @@ jobs:
             exit 0
           fi
 
+          # Wait for SSM agent to be ready (instance may have just been created)
+          echo "Waiting for SSM agent on $INSTANCE_ID..."
+          for i in $(seq 1 24); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || echo "Offline")
+            if [ "$STATUS" = "Online" ]; then
+              echo "SSM agent online after $((i*5))s"
+              break
+            fi
+            if [ "$i" = "24" ]; then
+              echo "::warning::SSM agent not online after 120s, skipping restart"
+              exit 0
+            fi
+            sleep 5
+          done
+
           echo "Restarting service on $INSTANCE_ID"
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
