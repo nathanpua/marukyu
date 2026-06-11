@@ -220,6 +220,13 @@ resource "aws_instance" "monitor" {
 
   iam_instance_profile = aws_iam_instance_profile.ec2.name
 
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      instance_interruption_behavior = "stop"
+    }
+  }
+
   metadata_options {
     http_tokens                 = "required"
     http_endpoint               = "enabled"
