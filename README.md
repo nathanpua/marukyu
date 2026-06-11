@@ -55,9 +55,29 @@ Telegram was chosen over Discord because Discord blocks requests from AWS IP add
 
 t2.micro has no instance store — EBS is required as the root volume. An 8 GB gp3 volume costs $0.72/month and persists across stop/start. The systemd service auto-resumes on boot via cloud-init provisioning.
 
-### Spot Instance
+### Spot Instance + Scheduler
 
-The instance runs as an EC2 Spot instance, which offers up to 70% discount compared to On-Demand pricing. For `t2.micro`, Spot interruptions are extremely rare. The instance is configured with `instance_interruption_behavior = "stop"` so that if interrupted, it stops (preserving EBS and the instance ID) rather than terminating. The Lambda scheduler can restart it on the next scheduled window.
+The instance runs as an EC2 Spot instance (~65% discount vs On-Demand). A Lambda scheduler (triggered by EventBridge) ensures the instance only runs during the required monitoring window:
+
+- **Start**: 9:30 AM JST (00:30 UTC), weekdays only
+- **Stop**: 5:30 PM JST (08:30 UTC), weekdays only
+- **Runtime**: ~8 hrs/day × 5 days = ~173 hrs/month
+
+The scheduler is necessary — without it, the instance runs 24/7 at $3.94/month vs $0.93/month scheduled. Since Lambda, EventBridge, and SQS are all free tier, the scheduler infrastructure costs $0.
+
+The Spot instance uses `persistent` type with `instance_interruption_behavior = "stop"`. This provides auto-recovery during working hours:
+
+```
+Spot interrupted (rare for t2.micro)
+    → Instance STOPPED (EBS + instance ID preserved)
+    → AWS detects capacity available
+    → Instance auto-STARTED (persistent request)
+    → systemd starts monitor automatically
+    → Wrapper re-fetches secrets from SSM
+    → Polling resumes (~2-5 min total downtime)
+```
+
+For `t2.micro` in `ap-southeast-1`, Spot interruptions are well under 5% monthly. The `stop` behavior ensures no data loss — EBS and the systemd service persist across stop/start cycles.
 
 ### Self-Bootstrapping
 
@@ -212,7 +232,7 @@ Apply workflow flow:
 
 | Resource | Monthly Cost |
 |---|---|
-| EC2 t2.micro Spot (~40 hr/week) | ~$0.80 |
+| EC2 t2.micro Spot (~173 hrs/month) | ~$0.93 |
 | EBS 8 GB gp3 | $0.72 |
 | Data transfer (first 100 GB free) | $0 |
 | Telegram Bot API | $0 |
@@ -220,4 +240,6 @@ Apply workflow flow:
 | DynamoDB (lock table, <1 WCU) | ~$0.01 |
 | Lambda (scheduler, free tier) | $0 |
 | CloudWatch Logs (free tier) | $0 |
-| **Total** | **~$1.54/month** |
+| **Total** | **~$1.67/month** |
+
+Spot pricing based on 30-day average for t2.micro in ap-southeast-1 ($0.0054/hr). On-demand equivalent would be $2.63/month for compute alone ($0.0152/hr).
